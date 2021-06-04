@@ -1,0 +1,928 @@
+---
+title: "model_dev3"
+author: "Brenwin"
+date: "19/05/2021"
+output: html_document
+---
+
+SCORE: 76.4% public
+SCORE: 79.4% private 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load libraries
+library(tidyverse)
+library(tidymodels)
+library(rsample)
+library(recipes)
+library(tune)
+library(dials)
+library(visdat)
+library(GGally)
+library(ggthemes)
+library(gt)
+```
+
+# read in data
+```{r}
+# read in training data
+fires_tr_full <- read_csv("data/student_training_release.csv") %>% 
+  mutate(cause = factor(cause,
+                        levels = c("lightning", "accident", "arson", "burning_off")))
+
+# --- read in cross validation set *scored on Kaggle
+fires_to_predict <- read_csv("data/student_predict_x_release.csv") %>% 
+  select(-id) # remove id column
+
+
+# impute most common factor; to missing levels
+fires_to_predict <- fires_to_predict %>% 
+  mutate(FOR_TYPE = case_when(is.na(FOR_TYPE) ~ "Non forest",
+                              TRUE ~ FOR_TYPE),
+         FOR_CAT = case_when(is.na(FOR_CAT) ~ "Native forest",
+                             TRUE ~ FOR_CAT),
+         COVER = case_when(is.na(COVER) ~ 2,
+                           TRUE ~ COVER),
+         HEIGHT = case_when(is.na(HEIGHT) ~ 2,
+                            TRUE ~ HEIGHT),
+         FOREST = case_when(is.na(FOREST) ~ 1,
+                            TRUE ~ FOREST)) 
+
+# add cause variable; so recipe can run
+fires_to_predict <- fires_to_predict %>% 
+  mutate(cause = fires_tr_full$cause[c(1:1022)]) %>% 
+   mutate(cause = factor(cause,
+                        levels = c("lightning", "accident", "arson", "burning_off")))
+```
+
+> `fires_tr_full` contains the full training set. `fires_to_predict` contains the test set required to predict.
+
+# Data Overview
+
+## response `cause`
+```{r}
+fires_tr_full %>%
+  count(cause) %>% 
+  mutate(percent = round(n/sum(n) * 100, 2)) %>% 
+  ggplot(aes(x = fct_reorder(cause, -n),
+               y = n,
+               fill = cause)) +
+  geom_col() +
+  geom_text(aes(label = paste0(n, " (", percent, "%)"))) +
+  scale_fill_manual(breaks = c("accident", "arson", "burning_off", "lightning"),
+                    values = c("dark orange", "red", "purple", "blue")) 
+```
+
+> the goal of the machine learning is to predict one of the four `cause` displayed above. 
+> `accidents`($37.65\%$) and `lightning`($34.55\%$) are by far the leading causes of bushfires in Melbourne Victoria. 
+> This is followed by `arson`($18.37\%$). With `burning_off` having the smallest percentage at $9.44\%$
+
+> Therefore, this is an **imbalanced** data set and our model should incorporate this information especially to focus on predicting the mostly common occuring cause more accurately. 
+
+## skim dataset
+```{r}
+skimr::skim(fires_tr_full)
+```
+
+## Fix missingness in data
+```{r}
+fires_tr_full %>% 
+  visdat::vis_miss(sort_miss = T,
+                   cluster = T)
+```
+
+> majority of missing observations arise from `ws`(windspeed) variables and are contained in the same rows.
+> There are some missingness in categorical variables (`FOR_CODE`, `FOR_TYPE`, `FOR_CAT`, `COVER`, `HEIGHT`, `FOREST`) and solar exposure variables `se` as well- Again, at the same observations. Considering the size of the data set, the number of missings here are insignificant and removed from the model as such. 
+
+```{r}
+ggmap::qmplot(x = lon,
+              y = lat,
+              data = fires_tr_full,
+              geom = "point",
+              colour = I("red"),
+              alpha = 0.4) +
+  scale_alpha(guide = "none") +
+  ggtitle("arson")
+```
+
+> It can be suspected that the missing wind data was due to inaccessibility. However, plotting the data, there are no structure found. (data points were also dense in the bottom right in the original data points)
+> So missingness in windspeed data are deduced to occur at random (no information) hence removed from the data set. 
+
+```{r}
+fires_tr_full <- fires_tr_full %>% 
+  na.omit() 
+```
+
+## nuisance observations
+```{r}
+fires_map_data <- fires_tr_full %>% 
+  select(cause, month, lat, lon) %>% 
+  # find total bushfires by cause & month
+  group_by(cause, month) %>% 
+  mutate(total_bushfire = n()) %>%
+  # find total bushfires by month
+  ungroup() %>% 
+  group_by(month) %>% 
+  mutate(month_total_bushfire = n()) %>% 
+  # 100 * total bushfires / total bushfires by month = % of bushfire caused
+  mutate(percent = round(total_bushfire/month_total_bushfire * 100), 2) %>% 
+  mutate(total_bushfire_percent = paste0(total_bushfire, " (", percent, "%)")) %>% 
+  select(cause, month, total_bushfire, percent, total_bushfire_percent, lat, lon)  
+
+fires_map_data %>% 
+  ggplot() +
+  geom_point(aes(x = lon,
+                 y = lat,
+                 colour = cause),
+             alpha = 0.3) +
+  geom_sf(data = filter(ozmaps::ozmap_states, NAME == "Victoria"),
+          alpha = 0) +
+  geom_text(aes(x = 147,
+                y = -35,
+                label = total_bushfire_percent)) +
+  facet_grid(month ~ cause) +
+  theme_map() +
+  theme(legend.position = "right")
+```
+> Here we plot the map of Victoria overlayed by bushfire occurences. The plots are faceted by months and categories.
+> Bushfire activities are highest in the hotter months from October(10) to December(12) and January(1) through to March(3). There are considerably fewer arason and burning off as compared to accidents and lightning.
+
+> From May to September, there were little to no activities and **do not seem to represent** the data set(nuisance observations) and response well. Hence these months are removed from the model.
+
+```{r}
+fires_tr_full <- fires_tr_full %>% 
+  filter(month %in% c(1:3, 10:12))
+```
+
+
+# Data exploration x Feature selection and engineering 
+
+> the goal of this feature selection part section is to find variables that has most information. That is, most variation **between the causes** in the test set.
+
+## split data into training and test set
+```{r}
+# --- split training set; into 2/3 training 1/3 test set
+set.seed(3000)
+
+split <- rsample::initial_split(fires_tr_full,
+                                prop = 3/4,
+                                strata = "cause") # ensure; cause; same proportion in training & test set
+
+fires_tr <- rsample::training(split) # extract training set
+fires_ts <- rsample::testing(split) # extract test set
+```
+
+```{r}
+# set aside training set for data exploration
+data_explore <- fires_tr
+```
+
+## Spatiotemporal Variables
+
+### plot map faceted by `cause` & `month` 
+```{r}
+fires_map_data <- data_explore %>% 
+  select(cause, month, lat, lon) %>% 
+  # find total bushfires by cause & month
+  group_by(cause, month) %>% 
+  mutate(total_bushfire = n()) %>%
+  # find total bushfires by month
+  ungroup() %>% 
+  group_by(month) %>% 
+  mutate(month_total_bushfire = n()) %>% 
+  # 100 * total bushfires / total bushfires by month = % of bushfire caused
+  mutate(percent = round(total_bushfire/month_total_bushfire * 100), 2) %>% 
+  mutate(total_bushfire_percent = paste0(total_bushfire, " (", percent, "%)")) %>% 
+  select(cause, month, total_bushfire, percent, total_bushfire_percent, lat, lon)
+
+fires_map_data %>% 
+  ggplot() +
+  geom_point(aes(x = lon,
+                 y = lat,
+                 colour = cause),
+             alpha = 0.3) +
+  geom_sf(data = filter(ozmaps::ozmap_states, NAME == "Victoria"),
+          alpha = 0) +
+  geom_text(aes(x = 147,
+                y = -35,
+                label = total_bushfire_percent)) +
+  facet_grid(month ~ cause) +
+  theme_map() +
+  theme(legend.position = "right") +
+  scale_colour_manual(breaks = c("accident", "arson", "burning_off", "lightning"),
+                    values = c("dark orange", "red", "purple", "blue"))
+```
+
+> January and Februrary seems to be more vulnerable to lightning. With more than half the bushfires caused by lightning
+> On the other hand, March seems to be hot for accident and arsons.    
+__`month` is used as predictor__
+__`year` is omitted from the model since 2019-2020 bushfire season is unprecedented.__ 
+
+### plot `lat`, `lon` of fire occurences overlaid on map
+```{r}
+ggmap::qmplot(x = lon,
+              y = lat,
+              data = data_explore,
+              geom = "point",
+              colour = cause,
+              alpha = 0.4) +
+  scale_alpha(guide = "none") +
+  ggtitle("arson") + 
+  scale_colour_manual(breaks = c("accident", "arson", "burning_off", "lightning"),
+                    values = c("dark orange", "red", "purple", "blue")) +
+  facet_wrap(. ~ cause)
+```
+
+> looking at the `lat`(vertical) and `lon`(horizontal). Immediately we see lightning is very dense on the bottom left and right of the map.
+> In the vertical direction(`lat`), lightning occurs on the bottom half due to the dense occurence around Mount Buller & Mount Bogong. 
+> On the other hand, we can observe that the most difference occur at the horizontal direction (`lon`) particularly around Mount Buller. Which seems to be inaccessible.
+
+> Using `lon`, we can clearly segment the left side and right side from the middle to distinguish lightning from the other variables.
+> However, this effect on the vertical direction is not as clear in the vertical direction(`lat`). Further examined below
+
+#### `lat` and `lon`
+```{r}
+# --- plot boxplot function
+plot_boxplot <- function(data, predictor){
+  # convert string to variable
+  predictor <- sym(predictor)
+  
+  # unquote variable using {{}}
+  data %>%
+  ggplot(aes(x = {{predictor}},
+             y = cause,
+             colour = cause)) +
+  geom_jitter(alpha = 0.2) +
+  geom_boxplot(alpha = 0,
+               colour = "black") +
+  scale_colour_manual(breaks = c("accident", "arson", "burning_off", "lightning"),
+                    values = c("dark orange", "red", "purple", "blue")) 
+}
+
+plot_density <- function(data, predictor){
+  # convert string to variable
+  predictor <- sym(predictor)
+  
+  data %>%
+  ggplot() +
+  geom_density(aes(x = {{predictor}},
+                   y = ..density..,
+                   colour = cause),
+               alpha = 0.2) +
+  scale_colour_manual(breaks = c("accident", "arson", "burning_off", "lightning"),
+                    values = c("dark orange", "red", "purple", "blue")) +
+  theme_bw()
+}
+
+# single number evaluation metric (difference between means) *used manually 
+single_no_eval <- function(data, predictor){
+  
+  predictor <- sym(predictor)
+  
+  data_explore %>% 
+    group_by(cause) %>% 
+    summarise(mean = mean({{predictor}})) %>% 
+    mutate(diff_mean = abs(mean - lag(mean))) %>% 
+    summarise(total_diff = sum(diff_mean, na.rm = T))
+}
+```
+
+
+```{r}
+# --- lat
+plot_boxplot(data_explore, "lat") 
+plot_density(data_explore, "lat")
+```
+
+> with boxplot and densities, as indicated earlier, we see lightning dense at the lower half of lat (bottom).
+> Lightning and burning off follow similar distributions. 
+> arson and accident follow similar distributions. 
+> This is not the most obvious.
+
+
+```{r}
+# --- lon
+plot_boxplot(data_explore, "lon")
+plot_density(data_explore, "lon")
+```
+
+> with `lon`, the boxplots displays apparent differences between the categories. 
+
+> the density for lightning and accident is clearly different. lightning is the densest nearest to the bottom right of the map (where Mount Buller is located) 
+
+> the map dynamics can be quickly capture by `lon`
+
+__`lat` is used in the model__
+__`lon` is used in the model__
+
+
+#### distance variables `dist_cfa`, `dist_camp`, `dist_road`
+> Furthermore, we can see that accidents & arson occuring closer to the road as we can expect. 
+> Hence we would think distance variables `dist_cfa`, `dist_camp`, `dist_road` to be important in distinguishing `cause`. We examine below
+
+```{r}
+plot_boxplot(data_explore, "dist_cfa") +
+  scale_x_log10()
+plot_density(data_explore, "dist_cfa") +
+  scale_x_log10()
+```
+> the distribution of `dist_cfa` was right skewed hence logged to make it more normally distributed 
+> distance from the nearst CFA produces a visible difference in distribution across the `cause`
+> arson and burning off occurs closer to CFA stations while `accident` and `lightning` further off
+
+```{r}
+plot_boxplot(data_explore, "dist_camp") +
+  scale_x_log10()
+plot_density(data_explore, "dist_camp") +
+  scale_x_log10()
+```
+> distance from camp is logged to overcome right-skewed distribution
+> distance from camp has a different distribution for accidents. it is multimodal compared to the other distributions and would help improve predictions on accidents. 
+
+```{r}
+plot_boxplot(data_explore, "dist_road") +
+  scale_x_log10()
+
+plot_density(data_explore, "dist_road") +
+  scale_x_log10()
+```
+
+> distance from road (`dist_road`) again has a right skewed distribution and hence logged. 
+> Lightning's distribution is clearly distinct from the others. Lightning occurence is usually farthest from the road. 
+
+__`dist_road` is used in model (log scaled)__
+__`dist_camp` is used in model (log scaled)__
+__`dist_cfa` is used in model (log scaled)__
+
+
+### plot bar plot of `cause` over `year`
+```{r}
+data_explore %>% 
+  group_by(year) %>% 
+  count(cause) %>% 
+  mutate(total = sum(n)) %>% 
+  ggplot() +
+  geom_col(aes(x = year,
+               y = total)) +
+  geom_col(aes(x = year,
+               y = n,
+               fill = cause)) +
+  facet_wrap(. ~ cause)
+```
+
+> In recent years, accidents have spiked up since 2013 and at an all time high in 2019-2020.
+> at the same time, arson is declining.
+
+> Lightning is rather sporadic, but relatively high throughout. 
+
+> Also, burning stays relatively constant over years
+
+> all in all, year seems important to distinguish between the variables 
+
+__However, `year` is not used in the model since bushfire season is unprecedented and is unlikely to follow this trend.__
+
+## numerical variables (climate variables)
+
+> Climate variables included in the data set are rainfall(`rf`), solar exposure(`se`), max and min temperature (`maxt` & `mint`) and wind speed (`ws`). 
+> However, multiple of each type of variable is provided that covers a different time horizon. For example, rainfall has `ar7` and `ar14` pertaining to average rainfall in the past 7 and 14 days respectively.
+> our goal here is to pick the most relevant variable and horizon to distinguish between the `cause`
+
+### rainfall (`rf`)
+
+```{r}
+# arf7
+data_explore %>% 
+  mutate(arf7_log = log(arf7 + 1)) %>% 
+  plot_boxplot(., "arf7_log")
+  
+data_explore %>% 
+  mutate(arf7_log = log(arf7 + 1)) %>% 
+  plot_density(., "arf7_log")
+
+# --- arf14
+plot_boxplot(data_explore, "arf14")
+plot_density(data_explore, "arf14")  
+
+plot_boxplot(data_explore, "arf28")
+plot_density(data_explore, "arf28")
+
+plot_boxplot(data_explore, "arf60")
+plot_density(data_explore, "arf60")
+
+plot_boxplot(data_explore, "arf90")
+plot_density(data_explore, "arf90")
+
+plot_boxplot(data_explore, "arf180")
+plot_density(data_explore, "arf180")
+
+plot_boxplot(data_explore, "arf360")
+plot_density(data_explore, "arf360")
+  
+plot_boxplot(data_explore, "arf720") 
+plot_density(data_explore, "arf720") 
+  
+
+```
+> long term rainfall i.e. average rainfall over past 2 years (`arf720`) is best at distinguishing the variables
+
+__arf720 included in model__
+
+### solar exposure (`se`)
+```{r}
+plot_boxplot(data_explore, "se")
+plot_density(data_explore, "se")
+
+plot_boxplot(data_explore, "ase7")
+plot_density(data_explore, "ase7")
+
+plot_boxplot(data_explore, "ase14")
+plot_density(data_explore, "ase14")
+
+plot_boxplot(data_explore, "ase28")
+plot_density(data_explore, "ase28")
+
+plot_boxplot(data_explore, "ase60")
+plot_density(data_explore, "ase60")
+
+plot_boxplot(data_explore, "ase90")
+plot_density(data_explore, "ase90")
+
+plot_boxplot(data_explore, "ase180")
+plot_density(data_explore, "ase180")
+
+plot_boxplot(data_explore, "ase360")
+plot_density(data_explore, "ase360")
+
+plot_boxplot(data_explore, "ase720")
+plot_density(data_explore, "ase720")
+```
+> In case of solar expore, mid-term solar exposure over 2 months seem to affect causes the most
+
+__`ase180` chosen__
+
+### max temperature (`maxt`)
+```{r}
+plot_boxplot(data_explore, "maxt")
+plot_density(data_explore, "maxt")
+
+plot_boxplot(data_explore, "amaxt7")
+plot_density(data_explore, "amaxt7")
+
+plot_boxplot(data_explore, "amaxt14")
+plot_density(data_explore, "amaxt14")
+
+plot_boxplot(data_explore, "amaxt28")
+plot_density(data_explore, "amaxt28")
+
+plot_boxplot(data_explore, "amaxt60")
+plot_density(data_explore, "amaxt60")
+
+plot_boxplot(data_explore, "amaxt90")
+plot_density(data_explore, "amaxt90")
+
+plot_boxplot(data_explore, "amaxt180")
+plot_density(data_explore, "amaxt180")
+
+plot_boxplot(data_explore, "amaxt360")
+plot_density(data_explore, "amaxt360")
+
+plot_boxplot(data_explore, "amaxt720")
+plot_density(data_explore, "amaxt720")
+```
+
+> mid-term average temperature of 7 days (`amaxt60`) seem to differentiate causes the most
+
+__pick `amaxt60`__
+
+### min tempreature `mint`
+```{r}
+plot_boxplot(data_explore, "mint")
+plot_density(data_explore, "mint")
+
+plot_boxplot(data_explore, "amint7")
+plot_density(data_explore, "amint7")
+
+plot_boxplot(data_explore, "amint14")
+plot_density(data_explore, "amint14")
+
+plot_boxplot(data_explore, "amint28")
+plot_density(data_explore, "amint28")
+
+plot_boxplot(data_explore, "amint60")
+plot_density(data_explore, "amint60")
+
+plot_boxplot(data_explore, "amint90")
+plot_density(data_explore, "amint90")
+
+plot_boxplot(data_explore, "amint180")
+plot_density(data_explore, "amint180")
+
+plot_boxplot(data_explore, "amint360")
+plot_density(data_explore, "amint360")
+
+plot_boxplot(data_explore, "amint720")
+plot_density(data_explore, "amint720")
+```
+> minimum temperature seems to differentiate `cause` the most. although `arson` and `accident` is not very distinguishable 
+
+__`mint` included in model__
+
+### windspeed `ws`
+```{r}
+plot_boxplot(data_explore, "ws")
+plot_density(data_explore, "ws")
+
+plot_boxplot(data_explore, "aws_m0")
+plot_density(data_explore, "aws_m0")
+
+plot_boxplot(data_explore, "aws_m1")
+plot_density(data_explore, "aws_m1")
+
+plot_boxplot(data_explore, "aws_m3")
+plot_density(data_explore, "aws_m3")
+
+plot_boxplot(data_explore, "aws_m6")
+plot_density(data_explore, "aws_m6")
+
+plot_boxplot(data_explore, "aws_m12")
+plot_density(data_explore, "aws_m12")
+
+plot_boxplot(data_explore, "aws_m24")
+plot_density(data_explore, "aws_m24")
+```
+`aws_m24` clearly distinguishes the `cause`. Each with different densities. 
+
+__aws24 picked__
+
+## Categorical Variables
+
+> The categorical variables in the data set are essentially forest descriptions. 
+
+> - `FOR_TYPE`: forest type
+  - `COVER`: crown cover class
+  - `HEIGHT`: height category
+
+> `FOR_CODE` encodes the different forest type (`FOR_TYPE`), `COVER` class and `HEIGHT` class.
+
+### forest type (`FOR_TYPE`)
+```{r}
+data_explore %>% 
+  count(cause, FOR_TYPE) %>% 
+  group_by(cause) %>% 
+  mutate(percent = round(n/sum(n) * 100, 2)) %>% 
+  gt()
+
+data_explore %>% 
+  group_by(cause, FOR_TYPE) %>% 
+  mutate(FOR_TYPE_count = n(),
+         .before = FIRE_START) %>% 
+  group_by(cause) %>% 
+  mutate(total_cause_count = n(),
+         .after = FOR_TYPE_count) %>% 
+  mutate(prop = FOR_TYPE_count/total_cause_count,
+         .after = total_cause_count) %>% 
+  distinct(cause, FOR_TYPE, .keep_all = T) %>%
+  ggplot(aes(x = cause,
+             y = FOR_TYPE,
+             fill = prop)) +
+  geom_bin2d() +
+  geom_text(aes(label = round(prop, 2))) +
+  scale_fill_continuous(type = "viridis") +
+  ylab("Forest Type")
+```
+
+> above shows the heatmap of forest types filled by proportion of cause in each forest type. It shows the forest fire occur in the same forest type. either non-forest or eucalypt medium open
+
+## crown cover class `COVER`
+```{r}
+data_explore %>% 
+  group_by(cause, COVER) %>% 
+  mutate(COVER_count = n(),
+         .before = FIRE_START) %>% 
+  group_by(cause) %>% 
+  mutate(total_cause_count = n(),
+         .after = COVER_count) %>% 
+  mutate(prop = COVER_count/total_cause_count,
+         .after = total_cause_count) %>% 
+  distinct(cause, COVER, .keep_all = T) %>% 
+  ggplot(aes(x = cause,
+             y = factor(COVER),
+             fill = prop)) +
+  geom_bin2d() +
+  geom_text(aes(label = round(prop, 2))) +
+  scale_fill_continuous(type = "viridis") +
+  ylab("Crown cover class")
+```
+> most fire occurences at crown cover category 2 and 6 
+
+
+## height category (`HEIGHT`)
+```{r}
+data_explore %>% 
+  group_by(cause, HEIGHT) %>% 
+  mutate(HEIGHT_count = n(),
+         .before = FIRE_START) %>% 
+  group_by(cause) %>% 
+  mutate(total_cause_count = n(),
+         .after = HEIGHT_count) %>% 
+  mutate(prop = HEIGHT_count/total_cause_count,
+         .after = total_cause_count) %>% 
+  distinct(cause, HEIGHT, .keep_all = T) %>% 
+  ggplot(aes(x = cause,
+             y = factor(HEIGHT),
+             fill = prop)) +
+  geom_bin2d() +
+  geom_text(aes(label = round(prop, 2))) +
+  scale_fill_continuous(type = "viridis")
+```
+
+> This is also the case for HEIGHT. most fire occurences occur at forest of height 2 and 6. 
+
+__`HEIGHT` is omitted from model__
+
+
+# Data Pre-processing (recipe)
+
+> Before creating recipe, we first select variables to be used in the model and split the data again:
+
+```{r}
+# === select predicts for model fitting
+
+# --- for training & test split
+fires_tr_full <- fires_tr_full %>% 
+  # select predictor variables
+  select(cause,
+         month, lat, lon,  # spatio-temporal variables
+         dist_cfa, dist_road, dist_camp, # distance variables
+         arf720, ase180, amaxt180, aws_m24) %>%  # climate variables
+  mutate(month = factor(month))
+
+# --- cv set
+fires_to_predict <- fires_to_predict %>% 
+  # select predictor variables
+  select(cause,
+         month, lat, lon,  # spatio-temporal variables
+         dist_cfa, dist_road, dist_camp, # distance variables
+         arf720, ase180, amaxt180, aws_m24) %>%  # climate variables
+  mutate(month = factor(month))
+```
+
+
+```{r}
+# --- split training set; into 2/3 training 1/3 test set
+set.seed(3000)
+
+split <- rsample::initial_split(fires_tr_full,
+                                prop = 3/4,
+                                strata = "cause") # ensure; cause; same proportion in training & test set
+
+fires_tr <- rsample::training(split) # extract training set
+fires_ts <- rsample::testing(split) # extract test set
+```
+
+
+
+```{r}
+fires_rec <- recipes::recipe(cause ~ .,
+                             data = fires_tr) %>% 
+  step_log(dist_cfa, dist_camp, dist_road) %>% 
+  step_dummy(month)
+```
+
+```{r}
+fires_tr_baked <- fires_rec %>% 
+  prep(fires_tr) %>% 
+  bake(fires_tr)
+
+fires_ts_baked <- fires_rec %>% 
+  prep(fires_ts) %>% 
+  bake(fires_ts)
+
+fires_tp_baked <- fires_rec %>% 
+  prep(fires_to_predict) %>% 
+  bake(fires_to_predict)
+```
+
+# Model Building
+
+## Model specification
+```{r}
+# --- model specification & set computational engine
+fires_rf <- parsnip::rand_forest() %>% # model specification  
+  set_engine("randomForest",  # set computational engine (randomForest package)
+             importance = TRUE, # compute variable importance
+             proximity = TRUE) %>% # compute proximity
+  set_mode("classification") # set classification mode
+```
+
+```{r}
+fires_rf <- fires_rf %>% 
+  parsnip::fit(cause ~ .,
+               data = fires_tr_baked)
+```
+
+```{r}
+fires_rf$fit$importance
+```
+
+```{r}
+fires_ts_baked %>% 
+  mutate(pred_rf = predict(fires_rf, fires_ts_baked)$.pred_class) %>% 
+  yardstick::accuracy(truth = cause,
+                      estimate = pred_rf)
+
+fires_ts_baked %>% 
+  mutate(pred_rf = predict(fires_rf, fires_ts_baked)$.pred_class) %>% 
+  count(pred_rf) %>% 
+  mutate(prop = n/sum(n))
+
+fires_tp_baked %>% 
+  mutate(pred_rf = predict(fires_rf, fires_tp_baked)$.pred_class) %>% 
+  mutate(Id = row_number(),
+         Category = pred_rf) %>% 
+  select(Id, Category) %>% 
+  count(Category) %>% 
+  mutate(prop = n/sum(n))
+```
+
+# Tuning hyperparams. 
+
+## Model specification x create `workflow`
+```{r}
+# --- model specification & set computational engine
+tune_spec <- parsnip::rand_forest(mtry = tune(),
+                                 trees = 1000,
+                                 min_n = tune()) %>%
+  set_engine("randomForest",  # set computational engine (randomForest package)
+             importance = TRUE, # compute variable importance
+             proximity = TRUE) %>% # compute proximity
+  set_mode("classification") # set classification mode
+```
+
+```{r}
+tune_wf <- workflow() %>% 
+  add_recipe(fires_rec) %>% 
+  add_model(tune_spec)
+```
+
+## Create 10-fold cross validation x tune `min_n` and `mtry` parameters one at a time
+```{r}
+# create 10 folds cross validation sets
+set.seed(234)
+fires_folds <- rsample::vfold_cv(fires_tr)
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(345)
+tune_res <- tune::tune_grid(tune_wf, # workflow object (mesh recipe & model)
+                            resamples = fires_folds,
+                            grid = 20) # can either be df. of tuning combinations or a positive integer (indicate no. of candidate parameter sets to be created automatically)
+```
+
+```{r}
+tune_res %>% 
+  tune::collect_metrics() %>%
+  filter(.metric == "accuracy") %>% 
+  select(mean, min_n, mtry) %>% 
+  pivot_longer(min_n:mtry,
+               values_to = "value",
+               names_to = "parameter") %>% 
+	# plot
+  ggplot(aes(x = value,
+             y = mean,
+             colour = parameter)) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~parameter, 
+             scales = "free") +
+  labs(x = NULL, 
+       y = "AUC") +
+  theme_bw()
+```
+
+> use area under ROC (`roc_auc`) instead of `accuracy` due to imbalanced data set
+
+> seems like low levels of `mtry` ($< 10$) is better
+  - this may indicate there are more than less relevant predictors since a lower `mtry` performs better
+> lower values of `min_n` also improves performance 
+
+## based on previous tuning results (above), create a grid of combination of `min_n` and `mtry` values and tune parameters on cv folds
+```{r}
+rf_grid <- dials::grid_regular(dials::mtry(range = c(4, 15)),
+                               dials::min_n(range = c(1, 10)),
+                               levels = 6)
+```
+
+```{r}
+set.seed(456)
+regular_res <- tune::tune_grid(tune_wf,
+                               resamples = fires_folds,
+                               grid = rf_grid)
+```
+
+```{r}
+regular_res %>% 
+  collect_metrics() %>% 
+  filter(.metric == "accuracy") %>% # extract area under ROC curve metric
+  mutate(min_n = factor(min_n)) %>%  # for plotting
+  # plot
+  ggplot(aes(x = mtry,
+             y = mean,
+             colour = min_n)) + # plot multiple min_n lines; different colours
+  geom_line(alpha = 0.5,
+            size = 1.5) +
+  geom_point() +
+  scale_x_continuous("", breaks = seq(from = 4, to = 15, by = 1)) +
+  labs(y = "AUC",
+       x = "mtry")
+```
+
+> therefore, the best model suggested by tuning has hyperparameters
+  - `min_n` = 1
+  - `mtry` = 4
+  
+## extract x fit best model
+
+```{r}
+# extrat model; based on (highest) mean roc_auc metric
+best_auc <- tune::select_best(regular_res,
+                              metric = "roc_auc")
+
+# update tune_spec(model specification) with params. of best_auc model
+final_rf <- tune::finalize_model(tune_spec,
+                                 parameters = best_auc)
+
+final_wf <- workflow() %>% 
+  add_recipe(fires_rec) %>% 
+  add_model(final_rf)
+```
+
+```{r}
+final_rf %>% 
+  set_engine("randomForest",
+             importance = TRUE,
+             proximity = TRUE) %>% 
+  set_mode("classification") %>% 
+  fit(cause ~ .,
+      data = fires_tr_baked) %>% 
+  vip::vip(geom = "point")
+```
+
+```{r}
+final_rf %>% 
+  set_engine("randomForest",
+             importance = TRUE,
+             proximity = TRUE) %>% 
+  set_mode("classification") %>% 
+  fit(cause ~ .,
+      data = fires_tr_baked) %>% 
+  vip::vip(geom = "point")
+```
+
+
+## evaluate against test set
+```{r}
+final_result <- final_wf %>% 
+  tune::last_fit(split)
+
+final_result %>% 
+  tune::collect_metrics()
+```
+
+```{r}
+final_result %>% 
+  tune::collect_predictions() %>% 
+  yardstick::accuracy(truth = cause,
+                          estimate = .pred_class)
+```
+
+
+## fit cross validation set and submit 
+```{r}
+# --- use randomForest engine
+final_fit <- final_wf %>% 
+  parsnip::fit(data = fires_tr) %>% 
+  workflows::pull_workflow_fit() 
+
+# --- use ranger 
+final_fit <- final_rf %>%
+  set_engine("ranger") %>%
+  set_mode("classification") %>%
+  fit(cause ~ .,
+      data = fires_tr_baked)
+```
+
+```{r}
+final_fit$fit$importance
+```
+
+
+```{r}
+fires_to_predict_p <- fires_tp_baked %>% 
+  mutate(pred_rf = predict(final_fit, fires_tp_baked)$.pred_class) %>% 
+  mutate(Id = row_number()) 
+  
+write_csv(fires_to_predict_p, file = "predictions_no1")  
+```
